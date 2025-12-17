@@ -196,7 +196,7 @@ class ReceiptPrinter {
 
   ///======================================================
   /// Helper: Find Matching Printer
-  /// IMPROVED: Better detection for LAN/Network printers
+  /// IMPROVED: Better detection for Windows 10 LAN printers
   ///======================================================
   static pf.Printer? _findMatchingPrinter(
     List<pf.Printer> osPrinters,
@@ -239,21 +239,30 @@ class ReceiptPrinter {
       if (savedIp != null) {
         debugPrint("   IP to match: $savedIp");
 
-        // Strategy A: Look for thermal printer keywords + IP match
-        // Many network thermal printers show up as "xprinter" or similar
+        // Strategy A: Look for any thermal/receipt printer keywords
+        final thermalKeywords = [
+          'xprinter',
+          'xp-',
+          'thermal',
+          'pos',
+          'receipt',
+          'blackcopper',
+          '80mm',
+          'zj-',
+          'rp-',
+        ];
+
         try {
           final thermalPrinter = osPrinters.firstWhere((p) {
             final name = p.name.toLowerCase();
             final url = p.url.toLowerCase();
 
             // Check if it's a thermal printer type
-            final isThermalType =
-                name.contains('xprinter') ||
-                name.contains('thermal') ||
-                name.contains('pos') ||
-                name.contains('receipt');
+            final isThermalType = thermalKeywords.any(
+              (kw) => name.contains(kw),
+            );
 
-            // Check if URL contains the IP (even if not visible in name)
+            // Check if URL contains the IP
             final hasMatchingIp = url.contains(savedIp);
 
             debugPrint(
@@ -269,47 +278,73 @@ class ReceiptPrinter {
           debugPrint("⚠️  No thermal printer found with IP");
         }
 
-        // Strategy B: If saved name contains keywords, match any printer with those keywords
-        // This helps when "Thermal Printer (.200)" should match "xprinter"
-        if (savedName.toLowerCase().contains('thermal') ||
-            savedName.toLowerCase().contains('xprinter')) {
+        // Strategy B: Match by IP pattern in saved name
+        // "Thermal Printer (.200)" -> extract ".200" -> match "192.168.123.200"
+        final ipSuffixMatch = RegExp(r'\(\.(\d+)\)').firstMatch(savedName);
+        if (ipSuffixMatch != null) {
+          final suffix = ipSuffixMatch.group(1);
+          debugPrint("   Extracted IP suffix from saved name: .$suffix");
+
+          // Try to find printer with matching IP ending
           try {
-            final keywordMatch = osPrinters.firstWhere((p) {
-              final osName = p.name.toLowerCase();
-              return osName.contains('xprinter') ||
-                  osName.contains('thermal') ||
-                  osName.contains('pos');
+            final ipMatch = osPrinters.firstWhere((p) {
+              final name = p.name.toLowerCase();
+              final isThermal = thermalKeywords.any((kw) => name.contains(kw));
+
+              // If thermal printer exists and saved name has this IP suffix,
+              // assume it's the same printer
+              return isThermal && savedIp.endsWith('.$suffix');
             });
-            debugPrint("✅ Found by thermal keyword: ${keywordMatch.name}");
-            return keywordMatch;
+
+            debugPrint("✅ Found by IP suffix matching: ${ipMatch.name}");
+            return ipMatch;
           } catch (e) {
-            debugPrint("⚠️  No keyword match");
+            debugPrint("⚠️  No IP suffix match");
           }
+        }
+
+        // Strategy C: If only ONE thermal printer exists, use it
+        // (Common scenario: user has one thermal printer installed)
+        final allThermalPrinters = osPrinters.where((p) {
+          final name = p.name.toLowerCase();
+          return thermalKeywords.any((kw) => name.contains(kw));
+        }).toList();
+
+        if (allThermalPrinters.length == 1) {
+          debugPrint(
+            "✅ Found single thermal printer, using it: ${allThermalPrinters[0].name}",
+          );
+          return allThermalPrinters[0];
+        } else if (allThermalPrinters.length > 1) {
+          debugPrint(
+            "⚠️  Multiple thermal printers found (${allThermalPrinters.length}), cannot auto-select",
+          );
         }
       }
     }
 
     // Method 3: Partial name match (for similar printer names)
     if (savedName.isNotEmpty) {
-      try {
-        final partialMatch = osPrinters.firstWhere((p) {
-          final osName = p.name.toLowerCase();
-          final customName = savedName.toLowerCase();
+      final keywords = savedName
+          .toLowerCase()
+          .split(RegExp(r'[\s\-_()]'))
+          .where((w) => w.length > 2)
+          .toList();
 
-          // Check if names contain common keywords
-          return (osName.contains('xprinter') &&
-                  customName.contains('xprinter')) ||
-              (osName.contains('thermal') && customName.contains('thermal')) ||
-              (osName.contains('blackcopper') &&
-                  customName.contains('blackcopper')) ||
-              (osName.contains('pos') && customName.contains('pos')) ||
-              osName.contains(customName) ||
-              customName.contains(osName);
-        });
-        debugPrint("✅ Found partial match: ${partialMatch.name}");
-        return partialMatch;
-      } catch (e) {
-        debugPrint("⚠️  No partial match found");
+      if (keywords.isNotEmpty) {
+        try {
+          final partialMatch = osPrinters.firstWhere((p) {
+            final osName = p.name.toLowerCase();
+
+            // Check if any significant keyword matches
+            return keywords.any((keyword) => osName.contains(keyword));
+          });
+
+          debugPrint("✅ Found partial match: ${partialMatch.name}");
+          return partialMatch;
+        } catch (e) {
+          debugPrint("⚠️  No partial match found");
+        }
       }
     }
 
@@ -325,23 +360,6 @@ class ReceiptPrinter {
         return urlMatch;
       } catch (e) {
         debugPrint("⚠️  No URL match found");
-      }
-    }
-
-    // Method 5: Last resort - if there's only one thermal/xprinter, use it
-    if (isNetworkPrinter) {
-      final thermalPrinters = osPrinters.where((p) {
-        final name = p.name.toLowerCase();
-        return name.contains('xprinter') ||
-            name.contains('thermal') ||
-            name.contains('pos');
-      }).toList();
-
-      if (thermalPrinters.length == 1) {
-        debugPrint(
-          "✅ Using single thermal printer found: ${thermalPrinters[0].name}",
-        );
-        return thermalPrinters[0];
       }
     }
 

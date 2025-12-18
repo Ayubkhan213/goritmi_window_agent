@@ -171,12 +171,7 @@ class ReceiptPrinter {
   }
 
   ///======================================================
-<<<<<<< HEAD
   /// LAN: PRINT KOT VIA SOCKET (ESC/POS)
-=======
-  /// Helper: Find Matching Printer
-  /// IMPROVED: Better detection for Windows 10 LAN printers
->>>>>>> 0f2afe05b9b77d7c3b471bbba810830ceaf4da70
   ///======================================================
   static Future<void> _printKotViaSocket({
     required BuildContext context,
@@ -360,7 +355,6 @@ class ReceiptPrinter {
     // ================= ITEMS TABLE ===============================
     // ============================================================
 
-<<<<<<< HEAD
     buffer.add(_escAlignLeft);
 
     final itemColWidth = paperWidth - 8;
@@ -369,33 +363,6 @@ class ReceiptPrinter {
     buffer.add(_escBold);
     final headerLine =
         _padRight('Item', itemColWidth) + _padCenter('Qty', qtyColWidth);
-=======
-        // Strategy A: Look for any thermal/receipt printer keywords
-        final thermalKeywords = [
-          'xprinter',
-          'xp-',
-          'thermal',
-          'pos',
-          'receipt',
-          'blackcopper',
-          '80mm',
-          'zj-',
-          'rp-',
-        ];
-
-        try {
-          final thermalPrinter = osPrinters.firstWhere((p) {
-            final name = p.name.toLowerCase();
-            final url = p.url.toLowerCase();
-
-            // Check if it's a thermal printer type
-            final isThermalType = thermalKeywords.any(
-              (kw) => name.contains(kw),
-            );
-
-            // Check if URL contains the IP
-            final hasMatchingIp = url.contains(savedIp);
->>>>>>> 0f2afe05b9b77d7c3b471bbba810830ceaf4da70
 
     buffer.add(_encode(headerLine));
     buffer.add(_newLine());
@@ -436,7 +403,6 @@ class ReceiptPrinter {
           }
         }
 
-<<<<<<< HEAD
         buffer.add(_newLine());
 
         // Notes if present
@@ -448,54 +414,11 @@ class ReceiptPrinter {
           for (var line in noteLines) {
             buffer.add(_encode(line));
             buffer.add(_newLine());
-=======
-        // Strategy B: Match by IP pattern in saved name
-        // "Thermal Printer (.200)" -> extract ".200" -> match "192.168.123.200"
-        final ipSuffixMatch = RegExp(r'\(\.(\d+)\)').firstMatch(savedName);
-        if (ipSuffixMatch != null) {
-          final suffix = ipSuffixMatch.group(1);
-          debugPrint("   Extracted IP suffix from saved name: .$suffix");
-
-          // Try to find printer with matching IP ending
-          try {
-            final ipMatch = osPrinters.firstWhere((p) {
-              final name = p.name.toLowerCase();
-              final isThermal = thermalKeywords.any((kw) => name.contains(kw));
-
-              // If thermal printer exists and saved name has this IP suffix,
-              // assume it's the same printer
-              return isThermal && savedIp.endsWith('.$suffix');
-            });
-
-            debugPrint("✅ Found by IP suffix matching: ${ipMatch.name}");
-            return ipMatch;
-          } catch (e) {
-            debugPrint("⚠️  No IP suffix match");
->>>>>>> 0f2afe05b9b77d7c3b471bbba810830ceaf4da70
           }
-        }
-
-        // Strategy C: If only ONE thermal printer exists, use it
-        // (Common scenario: user has one thermal printer installed)
-        final allThermalPrinters = osPrinters.where((p) {
-          final name = p.name.toLowerCase();
-          return thermalKeywords.any((kw) => name.contains(kw));
-        }).toList();
-
-        if (allThermalPrinters.length == 1) {
-          debugPrint(
-            "✅ Found single thermal printer, using it: ${allThermalPrinters[0].name}",
-          );
-          return allThermalPrinters[0];
-        } else if (allThermalPrinters.length > 1) {
-          debugPrint(
-            "⚠️  Multiple thermal printers found (${allThermalPrinters.length}), cannot auto-select",
-          );
         }
       }
     }
 
-<<<<<<< HEAD
     buffer.add(_encode(_dashes(paperWidth)));
     buffer.add(_escAlignCenter);
     buffer.add(_encode('Order paid'));
@@ -506,50 +429,6 @@ class ReceiptPrinter {
     buffer.add(_escCut);
 
     return buffer.toBytes();
-=======
-    // Method 3: Partial name match (for similar printer names)
-    if (savedName.isNotEmpty) {
-      final keywords = savedName
-          .toLowerCase()
-          .split(RegExp(r'[\s\-_()]'))
-          .where((w) => w.length > 2)
-          .toList();
-
-      if (keywords.isNotEmpty) {
-        try {
-          final partialMatch = osPrinters.firstWhere((p) {
-            final osName = p.name.toLowerCase();
-
-            // Check if any significant keyword matches
-            return keywords.any((keyword) => osName.contains(keyword));
-          });
-
-          debugPrint("✅ Found partial match: ${partialMatch.name}");
-          return partialMatch;
-        } catch (e) {
-          debugPrint("⚠️  No partial match found");
-        }
-      }
-    }
-
-    // Method 4: Try URL match (for USB printers)
-    if (savedUrl.isNotEmpty && !isNetworkPrinter) {
-      try {
-        final urlMatch = osPrinters.firstWhere(
-          (p) =>
-              p.name.toLowerCase() == savedUrl.toLowerCase() ||
-              p.url.toLowerCase() == savedUrl.toLowerCase(),
-        );
-        debugPrint("✅ Found URL match: ${urlMatch.name}");
-        return urlMatch;
-      } catch (e) {
-        debugPrint("⚠️  No URL match found");
-      }
-    }
-
-    debugPrint("❌ No matching printer found");
-    return null;
->>>>>>> 0f2afe05b9b77d7c3b471bbba810830ceaf4da70
   }
 
   // ============================================================

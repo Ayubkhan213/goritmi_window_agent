@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart' as intl;
@@ -7,835 +8,967 @@ import 'package:printing/printing.dart' as pf;
 import 'package:provider/provider.dart';
 import 'package:tenx_global_agent/core/services/hive_services/business_info_service.dart';
 import 'package:tenx_global_agent/models/order_response_model.dart';
+import 'package:tenx_global_agent/services/recept_printer_cable.dart';
 import '../printing_agent/provider/printing_agent_provider.dart';
-import 'package:http/http.dart' as http;
-import 'package:image/image.dart' as img;
 
 class ReceiptPrinter {
+  /// ESC/POS Commands
+  static final Uint8List _escAlignCenter = Uint8List.fromList([
+    0x1B,
+    0x61,
+    0x01,
+  ]);
+  static final Uint8List _escAlignLeft = Uint8List.fromList([0x1B, 0x61, 0x00]);
+  static final Uint8List _escBold = Uint8List.fromList([0x1B, 0x45, 0x01]);
+  static final Uint8List _escBoldOff = Uint8List.fromList([0x1B, 0x45, 0x00]);
+  static final Uint8List _escSizeNormal = Uint8List.fromList([
+    0x1D,
+    0x21,
+    0x00,
+  ]);
+  static final Uint8List _escSizeLarge = Uint8List.fromList([0x1D, 0x21, 0x11]);
+  static final Uint8List _escSizeDouble = Uint8List.fromList([
+    0x1D,
+    0x21,
+    0x22,
+  ]);
+  static final Uint8List _escCut = Uint8List.fromList([0x1D, 0x56, 0x00]);
+  static final Uint8List _escFeedLines = Uint8List.fromList([0x1B, 0x64, 0x03]);
+
+  static const int _width80mm = 48;
+  static const int _width58mm = 32;
+  static const int _width52mm = 24;
+
   ///======================================================
-  /// Print KOT Receipt
+  /// DETECT PRINTER TYPE (LAN vs USB)
+  ///======================================================
+  static bool _isLanPrinter(String printerUrl) {
+    final ipPattern = RegExp(r'^\d+\.\d+\.\d+\.\d+');
+    return ipPattern.hasMatch(printerUrl.trim()) || printerUrl.contains(':');
+  }
+
+  ///======================================================
+  /// DETECT PAPER WIDTH FROM PRINTER
+  ///======================================================
+  static int _detectPaperWidth(String printerName) {
+    final name = printerName.toLowerCase();
+    if (name.contains('52') || name.contains('52mm')) return _width52mm;
+    if (name.contains('58') || name.contains('58mm')) return _width58mm;
+    if (name.contains('80') ||
+        name.contains('80mm') ||
+        name.contains('90') ||
+        name.contains('90mm'))
+      return _width80mm;
+    return _width80mm;
+  }
+
+  ///======================================================
+  /// PRINT KOT - SMART ROUTING (LAN → ESC/POS, USB → PDF)
   ///======================================================
   static Future<void> printKOT({
     required BuildContext context,
-    required OrderResponse orderResponse,
+    required String orderId,
+    String orderType = '',
+    List<OrderItem>? items,
+    OrderResponse? orderResponse, // Optional for USB printing
   }) async {
     try {
-      debugPrint("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      debugPrint("🖨️  Starting KOT Print");
-      debugPrint("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
       final provider = Provider.of<PrintingAgentProvider>(
         context,
         listen: false,
       );
 
-      // Check if KOT printer is selected
       if (provider.kotPrinter == null) {
-        throw Exception(
-          'No KOT printer selected. Please select a printer in settings.',
+        throw Exception("KOT printer is not configured");
+      }
+
+      debugPrint('-----------------------------------');
+      debugPrint('KOT Printer: ${provider.kotPrinter!.name}');
+      debugPrint('KOT Printer URL: ${provider.kotPrinter!.url}');
+
+      // 🔍 CHECK PRINTER TYPE
+      if (_isLanPrinter(provider.kotPrinter!.url)) {
+        // ✅ LAN PRINTER → Use ESC/POS (This class)
+        debugPrint('🌐 Detected LAN printer → Using ESC/POS');
+        await _printKotViaSocket(
+          context: context,
+          orderId: orderId,
+          orderType: orderType,
+          items: items,
+          printerUrl: provider.kotPrinter!.url,
+          printerName: provider.kotPrinter!.name,
+        );
+      } else {
+        // ✅ USB/CABLE PRINTER → Use PDF (ReceiptPrintercable)
+        debugPrint('🔌 Detected USB printer → Using PDF');
+
+        if (orderResponse == null) {
+          throw Exception("OrderResponse is required for USB KOT printing");
+        }
+
+        await ReceiptPrintercable.printKOT(
+          context: context,
+          orderResponse: orderResponse,
         );
       }
 
-      debugPrint("🎯 Selected KOT Printer:");
-      debugPrint("   Name: ${provider.kotPrinter!.name}");
-      debugPrint("   URL: ${provider.kotPrinter!.url}");
-
-      // Get OS printers
-      final osPrinters = await pf.Printing.listPrinters();
-      debugPrint("📋 Found ${osPrinters.length} OS printers");
-
-      if (osPrinters.isEmpty) {
-        throw Exception('No printers found in system');
-      }
-
-      // Find matching printer
-      pf.Printer? targetPrinter = _findMatchingPrinter(
-        osPrinters,
-        provider.kotPrinter!,
-        'KOT',
-      );
-
-      if (targetPrinter == null) {
-        throw Exception(
-          'KOT printer "${provider.kotPrinter!.name}" not found. '
-          'Please refresh printers in settings.',
-        );
-      }
-
-      debugPrint("✅ Target printer found: ${targetPrinter.name}");
-
-      // Generate PDF
-      debugPrint("📄 Generating KOT PDF...");
-      final pdf = await _generateKotPDF(orderResponse: orderResponse);
-
-      // Print
-      debugPrint("🖨️  Sending to printer...");
-      await pf.Printing.directPrintPdf(
-        printer: targetPrinter,
-        onLayout: (_) async => pdf.save(),
-        name: 'KOT_orderId',
-        format: PdfPageFormat.roll80,
-      );
-
-      debugPrint("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      debugPrint("✅ KOT printed successfully!");
-      debugPrint("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-      if (context.mounted) {
-        _showMessage(context, 'KOT printed successfully!', Colors.green);
-      }
-    } catch (e) {
-      debugPrint("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      debugPrint("❌ KOT printing failed: $e");
-      debugPrint("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-      if (context.mounted) {
-        _showMessage(context, 'KOT printing failed: $e', Colors.red);
-      }
+      _showMessage(context, "✅ KOT printed successfully", Colors.green);
+    } catch (e, stack) {
+      debugPrint('❌ KOT printing error: $e');
+      debugPrintStack(stackTrace: stack);
+      _showMessage(context, "❌ KOT printing failed: $e", Colors.red);
       rethrow;
     }
   }
 
   ///======================================================
-  /// Print Customer Receipt
+  /// PRINT CUSTOMER RECEIPT - SMART ROUTING (LAN → ESC/POS, USB → PDF)
   ///======================================================
   static Future<void> printReceipt({
     required BuildContext context,
     required OrderResponse orderResponse,
   }) async {
     try {
-      debugPrint("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      debugPrint("🖨️  Starting Customer Receipt Print");
-      debugPrint("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
       final provider = Provider.of<PrintingAgentProvider>(
         context,
         listen: false,
       );
 
-      // Check if customer printer is selected
       if (provider.customerPrinter == null) {
-        throw Exception(
-          'No customer printer selected. Please select a printer in settings.',
+        throw Exception("Customer printer is not configured");
+      }
+
+      debugPrint('-----------------------------------');
+      debugPrint('Customer Printer: ${provider.customerPrinter!.name}');
+      debugPrint('Printer URL: ${provider.customerPrinter!.url}');
+
+      // 🔍 CHECK PRINTER TYPE
+      if (_isLanPrinter(provider.customerPrinter!.url)) {
+        // ✅ LAN PRINTER → Use ESC/POS (This class)
+        debugPrint('🌐 Detected LAN printer → Using ESC/POS');
+        await _printReceiptViaSocket(
+          context: context,
+          orderResponse: orderResponse,
+          printerUrl: provider.customerPrinter!.url,
+          printerName: provider.customerPrinter!.name,
+        );
+      } else {
+        // ✅ USB/CABLE PRINTER → Use PDF (ReceiptPrintercable)
+        debugPrint('🔌 Detected USB printer → Using PDF');
+        await ReceiptPrintercable.printReceipt(
+          context: context,
+          orderResponse: orderResponse,
         );
       }
 
-      debugPrint("🎯 Selected Customer Printer:");
-      debugPrint("   Name: ${provider.customerPrinter!.name}");
-      debugPrint("   URL: ${provider.customerPrinter!.url}");
-
-      // Get OS printers
-      final osPrinters = await pf.Printing.listPrinters();
-      debugPrint("📋 Found ${osPrinters.length} OS printers");
-
-      // Debug: Print all available printers
-      for (var printer in osPrinters) {
-        debugPrint("   📄 ${printer.name} - ${printer.url}");
-      }
-
-      if (osPrinters.isEmpty) {
-        throw Exception('No printers found in system');
-      }
-
-      // Find matching printer
-      pf.Printer? targetPrinter = _findMatchingPrinter(
-        osPrinters,
-        provider.customerPrinter!,
-        'Customer',
-      );
-
-      if (targetPrinter == null) {
-        debugPrint("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        debugPrint("❌ PRINTER NOT FOUND");
-        debugPrint("Saved: ${provider.customerPrinter!.name}");
-        debugPrint("Available printers:");
-        for (var p in osPrinters) {
-          debugPrint("  - ${p.name} (${p.url})");
-        }
-        debugPrint("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-        throw Exception(
-          'Customer printer "${provider.customerPrinter!.name}" not found. '
-          'Please refresh printers in settings.',
-        );
-      }
-
-      debugPrint("✅ Target printer matched: ${targetPrinter.name}");
-
-      // Generate PDF
-      debugPrint("📄 Generating receipt PDF...");
-      final pdf = await _generateReceiptPDF(orderResponse: orderResponse);
-
-      // Print
-      debugPrint("🖨️  Sending to printer: ${targetPrinter.name}");
-      await pf.Printing.directPrintPdf(
-        printer: targetPrinter,
-        onLayout: (_) async => pdf.save(),
-        name: 'Receipt_${orderResponse.order?.id}',
-        format: PdfPageFormat.roll80,
-      );
-
-      debugPrint("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      debugPrint("✅ Receipt printed successfully!");
-      debugPrint("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-      if (context.mounted) {
-        _showMessage(context, 'Receipt printed successfully!', Colors.green);
-      }
-    } catch (e) {
-      debugPrint("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      debugPrint("❌ Customer receipt printing failed: $e");
-      debugPrint("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-
-      if (context.mounted) {
-        _showMessage(context, 'Receipt printing failed: $e', Colors.red);
-      }
+      _showMessage(context, "✅ Receipt printed successfully", Colors.green);
+    } catch (e, stack) {
+      debugPrint('❌ Receipt printing error: $e');
+      debugPrintStack(stackTrace: stack);
+      _showMessage(context, "❌ Receipt printing failed: $e", Colors.red);
       rethrow;
     }
   }
 
   ///======================================================
-  /// Helper: Find Matching Printer
-  /// IMPROVED: Better detection for LAN/Network printers
+  /// LAN: PRINT KOT VIA SOCKET (ESC/POS)
   ///======================================================
-  static pf.Printer? _findMatchingPrinter(
-    List<pf.Printer> osPrinters,
-    dynamic customPrinter,
-    String printerType,
-  ) {
-    final String savedName = customPrinter.name ?? '';
-    final String savedUrl = customPrinter.url ?? '';
+  static Future<void> _printKotViaSocket({
+    required BuildContext context,
+    required String orderId,
+    required String orderType,
+    required List<OrderItem>? items,
+    required String printerUrl,
+    required String printerName,
+  }) async {
+    final paperWidth = _detectPaperWidth(printerName);
+    debugPrint("🖨️ Detected KOT paper width: $paperWidth chars");
 
-    debugPrint("🔍 Matching $printerType printer:");
-    debugPrint("   Looking for: $savedName");
-    debugPrint("   URL: $savedUrl");
+    final data = await _generateKOTData(
+      orderId: orderId,
+      orderType: orderType,
+      items: items,
+      paperWidth: paperWidth,
+    );
 
-    // Determine if this is a network printer by checking if URL contains an IP
-    final bool isNetworkPrinter = _isIpAddress(savedUrl);
+    await _sendToSocket(printerUrl, data);
+  }
 
-    if (isNetworkPrinter) {
-      debugPrint("   🌐 Detected as NETWORK/LAN printer");
-    } else {
-      debugPrint("   🔌 Detected as USB/LOCAL printer");
-    }
+  ///======================================================
+  /// LAN: PRINT RECEIPT VIA SOCKET (ESC/POS)
+  ///======================================================
+  static Future<void> _printReceiptViaSocket({
+    required BuildContext context,
+    required OrderResponse orderResponse,
+    required String printerUrl,
+    required String printerName,
+  }) async {
+    final paperWidth = _detectPaperWidth(printerName);
+    debugPrint("🖨️ Detected Receipt paper width: $paperWidth chars");
 
-    // Method 1: Exact name match (works for USB printers)
+    final data = await _generateReceiptData(
+      orderResponse,
+      paperWidth: paperWidth,
+    );
+
+    await _sendToSocket(printerUrl, data);
+  }
+
+  ///======================================================
+  /// SEND DATA TO SOCKET (LAN PRINTER)
+  ///======================================================
+  static Future<void> _sendToSocket(String printerUrl, Uint8List data) async {
+    Socket? socket;
+
     try {
-      final nameMatch = osPrinters.firstWhere(
-        (p) => p.name.trim().toLowerCase() == savedName.trim().toLowerCase(),
+      String ip;
+      int port;
+
+      if (printerUrl.contains(':')) {
+        final parts = printerUrl.split(':');
+        ip = parts[0].trim();
+        port = int.tryParse(parts[1].trim()) ?? 9100;
+      } else {
+        ip = printerUrl.trim();
+        port = 9100;
+      }
+
+      debugPrint("🖨️ Connecting to LAN printer at $ip:$port");
+
+      socket = await Socket.connect(
+        ip,
+        port,
+        timeout: const Duration(seconds: 5),
       );
-      debugPrint("✅ Found exact name match: ${nameMatch.name}");
-      return nameMatch;
+      debugPrint("✅ Connected to LAN printer");
+
+      socket.add(data);
+      await socket.flush();
+
+      debugPrint("✅ Data sent to LAN printer (${data.length} bytes)");
+      await Future.delayed(const Duration(milliseconds: 500));
     } catch (e) {
-      debugPrint("⚠️  No exact name match");
+      debugPrint("❌ LAN printer connection error: $e");
+      rethrow;
+    } finally {
+      socket?.destroy();
+      debugPrint("🔌 Socket closed");
+    }
+  }
+
+  ///======================================================
+  /// GENERATE KOT ESC/POS DATA - ADAPTIVE WIDTH
+  ///======================================================
+  static Future<Uint8List> _generateKOTData({
+    required String orderId,
+    String orderType = '',
+    List<OrderItem>? items,
+    int paperWidth = _width80mm,
+    String? customerName,
+    String? phoneNumber,
+    String? paymentMethod,
+  }) async {
+    final businessInfo = await BusinessInfoBoxService.getBusinessInfo();
+    final buffer = BytesBuilder();
+
+    // Remove top margin
+    buffer.add([0x1B, 0x32]);
+
+    buffer.add(_escAlignCenter);
+
+    buffer.add(_escSizeLarge);
+    buffer.add(
+      _encode(orderType.isNotEmpty ? orderType.toUpperCase() : 'EAT IN'),
+    );
+    buffer.add(_newLine());
+    buffer.add(_newLine());
+    buffer.add(_escSizeNormal);
+    buffer.add(_escBoldOff);
+
+    buffer.add(_escSizeDouble);
+    buffer.add(_escBold);
+    buffer.add(_encode(orderId));
+    buffer.add(_newLine());
+    buffer.add(_escSizeNormal);
+    buffer.add(_escBoldOff);
+
+    buffer.add(_newLine());
+    buffer.add(
+      _encode(
+        'Date: ${intl.DateFormat('dd/MM/yyyy HH:mm').format(DateTime.now())}',
+      ),
+    );
+    buffer.add(_newLine());
+    buffer.add(_encode(_dashes(paperWidth)));
+    buffer.add(_newLine());
+    buffer.add(_escSizeLarge);
+    buffer.add(_encode('KOT'));
+    buffer.add(_escSizeNormal);
+    buffer.add(_newLine());
+
+    buffer.add(_encode(_dashes(paperWidth)));
+    buffer.add(_newLine());
+    // ============================================================
+    // ================= ORDER DETAILS =============================
+    // ============================================================
+
+    buffer.add(_escAlignLeft);
+
+    // Payment Type
+    buffer.add(
+      _encode(
+        _formatLabelValueRight(
+          'Payment Type:',
+          paymentMethod ?? 'Cash',
+          paperWidth,
+        ),
+      ),
+    );
+    buffer.add(_newLine());
+
+    // Customer Name
+    buffer.add(
+      _encode(
+        _formatLabelValueRight(
+          'Customer Name:',
+          customerName ?? 'Eat in',
+          paperWidth,
+        ),
+      ),
+    );
+    buffer.add(_newLine());
+
+    // Phone Number (optional)
+    if (phoneNumber != null && phoneNumber.trim().isNotEmpty) {
+      buffer.add(
+        _encode(
+          _formatLabelValueRight('Contact Number:', phoneNumber, paperWidth),
+        ),
+      );
+      buffer.add(_newLine());
     }
 
-    // Method 2: For NETWORK printers - Special handling
-    if (isNetworkPrinter) {
-      debugPrint("🔍 Trying network printer detection strategies...");
+    buffer.add(_encode(_dashes(paperWidth)));
+    buffer.add(_newLine());
 
-      // Extract IP from saved URL
-      final savedIp = _extractIpFromUrl(savedUrl);
-      if (savedIp != null) {
-        debugPrint("   IP to match: $savedIp");
+    // ============================================================
+    // ================= ITEMS TABLE ===============================
+    // ============================================================
 
-        // Strategy A: Look for thermal printer keywords + IP match
-        // Many network thermal printers show up as "xprinter" or similar
-        try {
-          final thermalPrinter = osPrinters.firstWhere((p) {
-            final name = p.name.toLowerCase();
-            final url = p.url.toLowerCase();
+    buffer.add(_escAlignLeft);
 
-            // Check if it's a thermal printer type
-            final isThermalType =
-                name.contains('xprinter') ||
-                name.contains('thermal') ||
-                name.contains('pos') ||
-                name.contains('receipt');
+    final itemColWidth = paperWidth - 8;
+    final qtyColWidth = 8;
 
-            // Check if URL contains the IP (even if not visible in name)
-            final hasMatchingIp = url.contains(savedIp);
+    buffer.add(_escBold);
+    final headerLine =
+        _padRight('Item', itemColWidth) + _padCenter('Qty', qtyColWidth);
 
-            debugPrint(
-              "   Checking: ${p.name} | thermal=$isThermalType | ip=$hasMatchingIp",
-            );
+    buffer.add(_encode(headerLine));
+    buffer.add(_newLine());
+    buffer.add(_escBoldOff);
 
-            return isThermalType || hasMatchingIp;
-          });
+    // Items
+    if (items != null && items.isNotEmpty) {
+      for (var item in items) {
+        final name = _truncate(item.title ?? 'Item', itemColWidth);
+        final qty = '${item.quantity ?? 0}';
+        // 1️ Print NAME (normal)
+        buffer.add(_encode(_padRight(name, itemColWidth)));
 
-          debugPrint("✅ Found network thermal printer: ${thermalPrinter.name}");
-          return thermalPrinter;
-        } catch (e) {
-          debugPrint("⚠️  No thermal printer found with IP");
+        // 2️ Turn BOLD ON
+        buffer.add(_escBold);
+
+        // 3️ Print QTY (bold)
+        buffer.add(_encode(_padCenter(qty, qtyColWidth)));
+
+        // 4️ Turn BOLD OFF
+        buffer.add(_escBoldOff);
+        //  Check removed ingredients
+        if (item.removedIngredients != null &&
+            item.removedIngredients!.isNotEmpty) {
+          // Indent for "Remove"
+          // const removeIndent = ''; // 4 spaces
+
+          // buffer.add(_encode('$removeIndent Remove:'));
+
+          // buffer.add(_newLine());
+
+          // Indent further for each removed ingredient
+          const ingredientIndent = ''; // 8 spaces
+          for (var ing in item.removedIngredients!) {
+            buffer.add(_encode('$ingredientIndent Remove ${ing.name}'));
+
+            // buffer.add(_newLine());
+          }
         }
 
-        // Strategy B: If saved name contains keywords, match any printer with those keywords
-        // This helps when "Thermal Printer (.200)" should match "xprinter"
-        if (savedName.toLowerCase().contains('thermal') ||
-            savedName.toLowerCase().contains('xprinter')) {
-          try {
-            final keywordMatch = osPrinters.firstWhere((p) {
-              final osName = p.name.toLowerCase();
-              return osName.contains('xprinter') ||
-                  osName.contains('thermal') ||
-                  osName.contains('pos');
-            });
-            debugPrint("✅ Found by thermal keyword: ${keywordMatch.name}");
-            return keywordMatch;
-          } catch (e) {
-            debugPrint("⚠️  No keyword match");
+        buffer.add(_newLine());
+
+        // Notes if present
+        if (item.note != null && item.note!.isNotEmpty) {
+          final noteLines = _wrapText(
+            '  Note: ${item.note?.split('.').first}',
+            paperWidth - 2,
+          );
+          for (var line in noteLines) {
+            buffer.add(_encode(line));
+            buffer.add(_newLine());
           }
         }
       }
     }
 
-    // Method 3: Partial name match (for similar printer names)
-    if (savedName.isNotEmpty) {
-      try {
-        final partialMatch = osPrinters.firstWhere((p) {
-          final osName = p.name.toLowerCase();
-          final customName = savedName.toLowerCase();
+    buffer.add(_encode(_dashes(paperWidth)));
+    buffer.add(_escAlignCenter);
+    buffer.add(_encode('Order paid'));
+    buffer.add(_newLine());
+    buffer.add(_newLine());
 
-          // Check if names contain common keywords
-          return (osName.contains('xprinter') &&
-                  customName.contains('xprinter')) ||
-              (osName.contains('thermal') && customName.contains('thermal')) ||
-              (osName.contains('blackcopper') &&
-                  customName.contains('blackcopper')) ||
-              (osName.contains('pos') && customName.contains('pos')) ||
-              osName.contains(customName) ||
-              customName.contains(osName);
-        });
-        debugPrint("✅ Found partial match: ${partialMatch.name}");
-        return partialMatch;
-      } catch (e) {
-        debugPrint("⚠️  No partial match found");
-      }
-    }
+    buffer.add(_escFeedLines);
+    buffer.add(_escCut);
 
-    // Method 4: Try URL match (for USB printers)
-    if (savedUrl.isNotEmpty && !isNetworkPrinter) {
-      try {
-        final urlMatch = osPrinters.firstWhere(
-          (p) =>
-              p.name.toLowerCase() == savedUrl.toLowerCase() ||
-              p.url.toLowerCase() == savedUrl.toLowerCase(),
-        );
-        debugPrint("✅ Found URL match: ${urlMatch.name}");
-        return urlMatch;
-      } catch (e) {
-        debugPrint("⚠️  No URL match found");
-      }
-    }
-
-    // Method 5: Last resort - if there's only one thermal/xprinter, use it
-    if (isNetworkPrinter) {
-      final thermalPrinters = osPrinters.where((p) {
-        final name = p.name.toLowerCase();
-        return name.contains('xprinter') ||
-            name.contains('thermal') ||
-            name.contains('pos');
-      }).toList();
-
-      if (thermalPrinters.length == 1) {
-        debugPrint(
-          "✅ Using single thermal printer found: ${thermalPrinters[0].name}",
-        );
-        return thermalPrinters[0];
-      }
-    }
-
-    debugPrint("❌ No matching printer found");
-    return null;
+    return buffer.toBytes();
   }
 
-  /// Check if a string is an IP address
-  static bool _isIpAddress(String url) {
-    final ipPattern = RegExp(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$');
-    return ipPattern.hasMatch(url);
-  }
-
-  /// Extract IP address from URL string
-  static String? _extractIpFromUrl(String url) {
-    final ipMatch = RegExp(
-      r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})',
-    ).firstMatch(url);
-    return ipMatch?.group(1);
-  }
+  // ============================================================
+  // ================= HELPER FUNCTIONS =========================
+  // ============================================================
 
   ///======================================================
-  /// Generate KOT PDF
+  /// GENERATE CUSTOMER RECEIPT ESC/POS DATA - MATCHES PDF DESIGN
   ///======================================================
-  static Future<pw.Document> _generateKotPDF({
-    required OrderResponse orderResponse,
+  static Future<Uint8List> _generateReceiptData(
+    OrderResponse orderResponse, {
+    int paperWidth = _width80mm,
   }) async {
     final businessInfo = await BusinessInfoBoxService.getBusinessInfo();
     final order = orderResponse.order;
-    final pdf = pw.Document();
-    final logo = await getBWLogo(businessInfo?.business.logoUrl);
-    final regularFont = await pw.Font.helvetica();
-    final boldFont = await pw.Font.helveticaBold();
-    final times = await pw.Font.times();
-    final safeItems = orderResponse.order?.items ?? [];
+    final buffer = BytesBuilder();
 
-    double subtotal = (safeItems).fold(
-      0,
-      (prev, item) => prev + ((item.quantity ?? 0) * (item.price ?? 0)),
+    //buffer.add(_escInit);
+    buffer.add([0x1B, 0x32]);
+    // ============================================================
+    // =============== PRINT LOGO AT START =========================
+    // ============================================================
+    // if (businessInfo?.business.logoUrl != null &&
+    //     businessInfo!.business.logoUrl!.trim().isNotEmpty) {
+    //   try {
+    //     // Load image from URL
+    //     final ByteData imgBytes = await NetworkAssetBundle(
+    //       Uri.parse(businessInfo.business.logoUrl!),
+    //     ).load("");
+
+    //     final Uint8List imageData = imgBytes.buffer.asUint8List();
+
+    //     // Decode image
+    //     final img.Image? decodedImg = img.decodeImage(imageData);
+
+    //     if (decodedImg != null) {
+    //       // 🔥 Resize logo (WIDTH = 150px for small logo)
+    //       final img.Image resized = img.copyResize(
+    //         decodedImg,
+    //         width: 150, // change to 120 / 100 if you want even smaller
+    //         height: null,
+    //       );
+
+    //       final Generator generator = Generator(
+    //         paperWidth == _width80mm ? PaperSize.mm80 : PaperSize.mm58,
+    //         await CapabilityProfile.load(),
+    //       );
+
+    //       // Convert resized image to ESC/POS
+    //       final List<int> bytes = generator.image(resized);
+
+    //       buffer.add(bytes);
+    //       buffer.add(generator.reset());
+    //     }
+    //   } catch (e) {
+    //     debugPrint("Logo loading failed: $e");
+    //   }
+    // }
+
+    // ============================================================
+    // ================= BUSINESS HEADER ===========================
+    // ============================================================
+
+    buffer.add(_escAlignCenter);
+    buffer.add(_escAlignCenter);
+
+    buffer.add(_escSizeLarge);
+    buffer.add(_encode(order?.orderType ?? 'Eatin'));
+    buffer.add(_newLine2());
+    buffer.add(_newLine());
+    buffer.add(_escSizeNormal);
+    buffer.add(_escBoldOff);
+
+    buffer.add(_escSizeDouble);
+    buffer.add(_escBold);
+    buffer.add(_encode('${order?.id ?? 'N/A'}'));
+    buffer.add(_newLine());
+    buffer.add(_newLine());
+    buffer.add(_escSizeNormal);
+    buffer.add(_escBoldOff);
+    // Business Name (Bold)
+    buffer.add(paperWidth >= _width58mm ? _escSizeLarge : _escSizeNormal);
+    buffer.add(_escBold);
+
+    final businessName = businessInfo?.business.businessName ?? 'BUSINESS NAME';
+    buffer.add(_encode(_truncate(businessName, paperWidth)));
+    buffer.add(_newLine());
+    buffer.add(_newLine());
+
+    buffer.add(_escSizeNormal);
+    buffer.add(_escBoldOff);
+
+    // Order ID
+    // buffer.add(_encode('Order ID: #${order?.id ?? 'N/A'}'));
+    // buffer.add(_newLine());
+
+    // Date
+    buffer.add(
+      _encode(
+        'Date: ${intl.DateFormat('dd/MM/yyyy HH:mm').format(DateTime.now())}',
+      ),
     );
-    double totalPrice =
-        subtotal +
-        (order?.deliveryCharges ?? 0.0) +
-        (order?.tax ?? 0.0) -
-        (order?.salesDiscount ?? 0.0) -
-        (order?.approvedDiscounts ?? 0.0);
+    buffer.add(_newLine());
 
-    pdf.addPage(
-      pw.Page(
-        pageFormat: PdfPageFormat.roll80.copyWith(
-          marginTop: 0,
-          marginBottom: 5,
-          marginLeft: 8,
-          marginRight: 20,
+    buffer.add(_encode(_dashes(paperWidth)));
+    buffer.add(_newLine());
+
+    // ============================================================
+    // ================= ORDER DETAILS =============================
+    // ============================================================
+
+    buffer.add(_escAlignLeft);
+
+    // Payment Type
+    buffer.add(
+      _encode(
+        _formatLabelValueRight(
+          'Payment Type:',
+          order?.paymentMethod ?? 'Cash',
+          paperWidth,
         ),
-        theme: pw.ThemeData.withFont(base: regularFont, bold: boldFont),
-        build: (context) {
-          return pw.Column(
-            crossAxisAlignment: pw.CrossAxisAlignment.start,
-            children: [
-              /// 🔹 KOT Title
-              pw.Center(
-                child: pw.Text(
-                  'KITCHEN ORDER TICKET',
-                  style: pw.TextStyle(fontSize: 16, font: boldFont),
-                ),
-              ),
+      ),
+    );
+    buffer.add(_newLine());
 
-              pw.SizedBox(height: 5),
+    // Order Type
+    // buffer.add(
+    //   _encode(
+    //     _formatLabelValueRight(
+    //       'Order Type:',
+    //       order?.orderType ?? 'Eatin',
+    //       paperWidth,
+    //     ),
+    //   ),
+    // );
+    // buffer.add(_newLine());
 
-              /// 🔹 Order Type
-              pw.Center(
-                child: pw.Text(
-                  order?.orderType ?? 'Eat In',
-                  style: pw.TextStyle(fontSize: 14, font: boldFont),
-                ),
-              ),
-
-              pw.SizedBox(height: 5),
-
-              /// 🔹 Order ID
-              pw.Center(
-                child: pw.Text(
-                  'Order ID: #${order?.id ?? 123}',
-                  style: pw.TextStyle(fontSize: 10),
-                ),
-              ),
-
-              /// 🔹 Date & Time
-              pw.Center(
-                child: pw.Text(
-                  'Date: ${intl.DateFormat('dd/MM/yyyy HH:mm').format(DateTime.now())}',
-                  style: pw.TextStyle(fontSize: 9),
-                ),
-              ),
-
-              pw.SizedBox(height: 5),
-              dottedBorder(),
-
-              /// 🔹 Items Header
-              pw.Padding(
-                padding: const pw.EdgeInsets.only(right: 4),
-                child: pw.Row(
-                  children: [
-                    pw.Expanded(
-                      child: pw.Text(
-                        'Item',
-                        style: pw.TextStyle(fontSize: 10, font: boldFont),
-                      ),
-                    ),
-                    pw.Text(
-                      'Qty',
-                      style: pw.TextStyle(fontSize: 10, font: boldFont),
-                    ),
-                  ],
-                ),
-              ),
-
-              pw.SizedBox(height: 3),
-
-              /// 🔹 Items List (NO PRICE)
-              ...safeItems.map(
-                (item) => pw.Padding(
-                  padding: const pw.EdgeInsets.only(right: 4, top: 3),
-                  child: pw.Row(
-                    crossAxisAlignment: pw.CrossAxisAlignment.start,
-                    children: [
-                      pw.Expanded(
-                        child: pw.Text(
-                          item.title ?? '',
-                          style: const pw.TextStyle(fontSize: 9),
-                        ),
-                      ),
-                      pw.Text(
-                        'x${item.quantity ?? 0}',
-                        style: const pw.TextStyle(fontSize: 9),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-
-              pw.SizedBox(height: 5),
-              dottedBorder(),
-
-              /// 🔹 Footer
-              pw.Center(
-                child: pw.Text(
-                  'Please prepare this order',
-                  style: pw.TextStyle(fontSize: 9, font: regularFont),
-                ),
-              ),
-            ],
-          );
-        },
+    // Customer Name
+    buffer.add(
+      _encode(
+        _formatLabelValueRight(
+          'Customer Name:',
+          order?.customerName ?? 'Eat in',
+          paperWidth,
+        ),
       ),
     );
 
-    return pdf;
-  }
-
-  /// Convert image bytes to black & white (for thermal printer)
-  static Uint8List convertToBW(Uint8List inputBytes) {
-    final original = img.decodeImage(inputBytes);
-    if (original == null) return inputBytes;
-
-    final bw = img.grayscale(original);
-    return Uint8List.fromList(img.encodePng(bw));
-  }
-
-  static Future<pw.ImageProvider?> getBWLogo(String? url) async {
-    if (url == null || url.isEmpty) return null;
-
-    try {
-      final response = await http.get(Uri.parse(url));
-      if (response.statusCode == 200) {
-        final bytes = response.bodyBytes;
-        final bwBytes = convertToBW(bytes);
-        return pw.MemoryImage(bwBytes);
-      }
-    } catch (e) {
-      debugPrint('Failed to load logo: $e');
+    // Phone Number (optional)
+    if (order?.phoneNumber != null && order!.phoneNumber!.trim().isNotEmpty) {
+      buffer.add(
+        _encode(
+          _formatLabelValueRight(
+            'Contact Number:',
+            order.phoneNumber!,
+            paperWidth,
+          ),
+        ),
+      );
+      buffer.add(_newLine());
     }
 
-    return null;
+    buffer.add(_newLine());
+    buffer.add(_encode(_dashes(paperWidth)));
+    buffer.add(_newLine());
+
+    // ============================================================
+    // ================= ITEMS TABLE ===============================
+    // ============================================================
+
+    buffer.add(_escAlignLeft);
+
+    final itemColWidth = paperWidth - 18;
+    final qtyColWidth = 8;
+    final priceColWidth = 10;
+
+    buffer.add(_escBold);
+    final headerLine =
+        _padRight('Item', itemColWidth) +
+        _padCenter('Qty', qtyColWidth) +
+        _padLeft('Price', priceColWidth);
+
+    buffer.add(_encode(headerLine));
+    buffer.add(_newLine());
+    buffer.add(_escBoldOff);
+
+    // Items
+    if (order?.items != null && order!.items!.isNotEmpty) {
+      for (var item in order.items!) {
+        final name = _truncate(item.title ?? 'Item', itemColWidth);
+        final qty = '${item.quantity ?? 0}';
+        final price = '£${(item.price ?? 0).toStringAsFixed(2)}';
+        // 1️ Print NAME (normal)
+        buffer.add(_encode(_padRight(name, itemColWidth)));
+
+        // 2️ Turn BOLD ON
+        buffer.add(_escBold);
+
+        // 3️ Print QTY + PRICE (bold)
+        buffer.add(
+          _encode(
+            _padCenter(qty, qtyColWidth) + _padLeft(price, priceColWidth),
+          ),
+        );
+
+        // 4️ Turn BOLD OFF
+        buffer.add(_escBoldOff);
+        //  Check removed ingredients
+        if (item.removedIngredients != null &&
+            item.removedIngredients!.isNotEmpty) {
+          // Indent for "Remove"
+          // const removeIndent = ''; // 4 spaces
+
+          // buffer.add(_encode('$removeIndent Remove'));
+
+          // buffer.add(_newLine());
+
+          // Indent further for each removed ingredient
+          const ingredientIndent = ''; // 8 spaces
+          for (var ing in item.removedIngredients!) {
+            buffer.add(_encode('$ingredientIndent Remove ${ing.name}'));
+
+            buffer.add(_newLine());
+          }
+        }
+        if (item.removedIngredients != null &&
+            item.removedIngredients!.isEmpty) {
+          buffer.add(_newLine());
+        }
+      }
+    }
+
+    buffer.add(_encode(_dashes(paperWidth)));
+    buffer.add(_newLine());
+
+    // ============================================================
+    // ================= TOTALS ===================================
+    // ============================================================
+
+    buffer.add(_escAlignLeft);
+
+    final subtotal = order?.subTotal ?? 0;
+    final approvedDiscount = order?.approvedDiscounts ?? 0;
+    final salesDiscount = order?.salesDiscount ?? 0;
+    final promoDiscount = order?.promoDiscount ?? 0;
+    final deliveryCharges = order?.deliveryCharges ?? 0;
+    final total = order?.totalAmount ?? 0;
+    printLabelValueRightBold(
+      buffer: buffer,
+      label: 'Order Price:',
+      value: '£${orderResponse.order?.subTotal?.toStringAsFixed(2)}',
+      escBoldOn: _escBold,
+      escBoldOff: _escBoldOff,
+      encode: _encode,
+      totalWidth: paperWidth,
+    );
+
+    printLabelValueRightBold(
+      buffer: buffer,
+      label: 'Services Charges:',
+      value: '£${orderResponse.order?.serviceCharges?.toStringAsFixed(2)}',
+      escBoldOn: _escBold,
+      escBoldOff: _escBoldOff,
+      encode: _encode,
+      totalWidth: paperWidth,
+    );
+
+    buffer.add(_newLine());
+
+    if (approvedDiscount > 0) {
+      printLabelValueRightBold(
+        buffer: buffer,
+        label: 'Discount:',
+        value: '-£${approvedDiscount.toStringAsFixed(2)}',
+        escBoldOn: _escBold,
+        escBoldOff: _escBoldOff,
+        encode: _encode,
+        totalWidth: paperWidth,
+      );
+
+      buffer.add(_newLine());
+    }
+
+    if (salesDiscount > 0) {
+      printLabelValueRightBold(
+        buffer: buffer,
+        label: 'Sale:',
+        value: '-£${salesDiscount.toStringAsFixed(2)}',
+        escBoldOn: _escBold,
+        escBoldOff: _escBoldOff,
+        encode: _encode,
+        totalWidth: paperWidth,
+      );
+
+      buffer.add(_newLine());
+    }
+
+    if (promoDiscount > 0) {
+      printLabelValueRightBold(
+        buffer: buffer,
+        label: 'Promo Discount:',
+        value: '-£${promoDiscount.toStringAsFixed(2)}',
+        escBoldOn: _escBold,
+        escBoldOff: _escBoldOff,
+        encode: _encode,
+        totalWidth: paperWidth,
+      );
+
+      buffer.add(_newLine());
+    }
+
+    if (orderResponse.type == 'Delivery' && deliveryCharges > 0) {
+      printLabelValueRightBold(
+        buffer: buffer,
+        label: 'Delivery Charges:',
+        value: '${deliveryCharges.toStringAsFixed(0)}%',
+        escBoldOn: _escBold,
+        escBoldOff: _escBoldOff,
+        encode: _encode,
+        totalWidth: paperWidth,
+      );
+
+      buffer.add(_newLine());
+    }
+    printLabelValueRightBold(
+      buffer: buffer,
+      label: 'Net Price:',
+      value: '£${total.toStringAsFixed(2)}',
+      escBoldOn: _escBold,
+      escBoldOff: _escBoldOff,
+      encode: _encode,
+      totalWidth: paperWidth,
+    );
+    printLabelValueRightBold(
+      buffer: buffer,
+      label: 'Paid Amount:',
+      value: '£${total.toStringAsFixed(2)}',
+      escBoldOn: _escBold,
+      escBoldOff: _escBoldOff,
+      encode: _encode,
+      totalWidth: paperWidth,
+    );
+
+    printLabelValueRightBold(
+      buffer: buffer,
+      label: 'Outstanding:',
+      value: ' 0.0',
+      escBoldOn: _escBold,
+      escBoldOff: _escBoldOff,
+      encode: _encode,
+      totalWidth: paperWidth,
+    );
+
+    buffer.add(_escBoldOff);
+    buffer.add(_newLine());
+
+    buffer.add(_encode(_dashes(paperWidth)));
+    buffer.add(_newLine());
+    buffer.add(_escBold);
+    buffer.add(_encode('VAT/ Taxes'));
+    buffer.add(_escBoldOff);
+    buffer.add(_newLine());
+
+    printLabelValueRightBold(
+      buffer: buffer,
+      label: 'Total VAT',
+      value: '£${orderResponse.order?.tax?.toStringAsFixed(2)}',
+      escBoldOn: _escBold,
+      escBoldOff: _escBoldOff,
+      encode: _encode,
+      totalWidth: paperWidth,
+    );
+
+    buffer.add(_newLine());
+    buffer.add(_encode(_dashes(paperWidth)));
+    buffer.add(_newLine());
+
+    // ============================================================
+    // ================= FOOTER ===================================
+    // ============================================================
+
+    buffer.add(_escAlignCenter);
+    // Phone
+    if (businessInfo?.business.phone != null) {
+      buffer.add(
+        _encode(_truncate('Tel: ${businessInfo!.business.phone}', paperWidth)),
+      );
+      buffer.add(_newLine());
+    }
+
+    if (businessInfo?.user.email != null &&
+        businessInfo!.user.email!.isNotEmpty) {
+      buffer.add(_encode('Email: ${businessInfo.user.email}'));
+      buffer.add(_newLine());
+    }
+
+    if (businessInfo!.business.address.isNotEmpty) {
+      final lines = _wrapText(
+        'Location: ${businessInfo.business.address}',
+        paperWidth,
+      );
+
+      for (var line in lines) {
+        buffer.add(_encode(line));
+        buffer.add(_newLine());
+      }
+    }
+
+    buffer.add(_newLine());
+    buffer.add(_encode('Thank you for your order!'));
+    buffer.add(_newLine());
+    buffer.add(_newLine());
+
+    buffer.add(_escFeedLines);
+    buffer.add(_escCut);
+
+    return buffer.toBytes();
   }
 
   ///======================================================
-  /// Generate Customer Receipt PDF
+  /// HELPER FUNCTIONS
   ///======================================================
-  static Future<pw.Document> _generateReceiptPDF({
-    required OrderResponse orderResponse,
-  }) async {
-    final businessInfo = await BusinessInfoBoxService.getBusinessInfo();
-    final order = orderResponse.order;
-    final pdf = pw.Document();
-    final logo = await getBWLogo(businessInfo?.business.logoUrl);
-    final regularFont = await pw.Font.helvetica();
-    final boldFont = await pw.Font.helveticaBold();
-    final times = await pw.Font.times();
-    final safeItems = orderResponse.order?.items ?? [];
 
-    double subtotal = (safeItems).fold(
-      0,
-      (prev, item) => prev + ((item.quantity ?? 0) * (item.price ?? 0)),
-    );
-    double totalPrice =
-        subtotal +
-        (order?.deliveryCharges ?? 0.0) +
-        (order?.tax ?? 0.0) -
-        (order?.salesDiscount ?? 0.0) -
-        (order?.approvedDiscounts ?? 0.0);
-
-    pdf.addPage(
-      pw.Page(
-        pageFormat: PdfPageFormat.roll80.copyWith(
-          marginTop: 0,
-          marginBottom: 5,
-          marginLeft: 8,
-          marginRight: 20,
-        ),
-        theme: pw.ThemeData.withFont(base: regularFont, bold: boldFont),
-        build: (context) {
-          return pw.Column(
-            crossAxisAlignment: pw.CrossAxisAlignment.start,
-            children: [
-              pw.Center(
-                child: pw.Text(
-                  order?.orderType ?? 'Eatin',
-                  style: pw.TextStyle(
-                    fontSize: 18,
-                    font: regularFont,
-                    fontWeight: pw.FontWeight.bold,
-                  ),
-                ),
-              ),
-              pw.SizedBox(height: 5),
-              pw.Center(
-                child: pw.Text(
-                  businessInfo?.business.businessName ?? 'Business Name',
-                  style: pw.TextStyle(
-                    fontSize: 12,
-                    font: regularFont,
-                    fontWeight: pw.FontWeight.bold,
-                  ),
-                ),
-              ),
-              pw.SizedBox(height: 5),
-              pw.Center(
-                child: pw.Text(
-                  'Date: ${intl.DateFormat('dd/MM/yyyy HH:mm').format(DateTime.now())}',
-                  style: pw.TextStyle(fontSize: 9, font: times),
-                ),
-              ),
-              pw.SizedBox(height: 5),
-              dottedBorder(),
-              _labelValue(
-                'Payment Type',
-                order?.paymentMethod ?? 'Cash',
-                regularFont,
-              ),
-              _labelValue(
-                'Order Type',
-                order?.orderType ?? 'Eatin',
-                regularFont,
-              ),
-              _labelValue(
-                'Customer Name',
-                order?.customerName ?? 'Eat in',
-                regularFont,
-              ),
-              if (order?.phoneNumber != null && order?.phoneNumber != '')
-                _labelValue(
-                  'Contact Number',
-                  order?.phoneNumber ?? '',
-                  regularFont,
-                ),
-              dottedBorder(),
-              pw.Padding(
-                padding: pw.EdgeInsets.only(right: 4.0),
-                child: pw.Row(
-                  children: [
-                    pw.Expanded(
-                      child: pw.Text(
-                        'Item',
-                        style: pw.TextStyle(font: boldFont, fontSize: 9.0),
-                      ),
-                    ),
-                    pw.SizedBox(width: 40),
-                    pw.Text(
-                      'Qty',
-                      style: pw.TextStyle(fontSize: 9.0, font: boldFont),
-                    ),
-                    pw.SizedBox(width: 40),
-                    pw.Text(
-                      'Price',
-                      style: pw.TextStyle(fontSize: 9.0, font: boldFont),
-                    ),
-                  ],
-                ),
-              ),
-              ...safeItems
-                  .map(
-                    (item) => pw.Column(
-                      children: [
-                        pw.SizedBox(height: 5),
-                        pw.Padding(
-                          padding: pw.EdgeInsets.only(right: 4.0),
-                          child: pw.Row(
-                            children: [
-                              pw.Expanded(
-                                child: pw.Text(
-                                  item.title ?? '',
-                                  style: pw.TextStyle(fontSize: 9.0),
-                                ),
-                              ),
-                              pw.SizedBox(width: 40),
-                              pw.Text(
-                                'x${item.quantity ?? 0}',
-                                style: pw.TextStyle(fontSize: 9.0),
-                              ),
-                              pw.SizedBox(width: 40),
-                              pw.Text(
-                                '£${item.price!.toStringAsFixed(2)}',
-                                style: pw.TextStyle(fontSize: 9.0),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                  )
-                  .toList(),
-              dottedBorder(),
-              pw.Column(
-                crossAxisAlignment: pw.CrossAxisAlignment.start,
-                children: [
-                  pw.SizedBox(height: 5),
-                  _labelValue(
-                    'Subtotal',
-                    '£${order?.subTotal?.toStringAsFixed(2)}',
-                    regularFont,
-                  ),
-                  if ((order?.approvedDiscounts ?? 0.0) > 0.0)
-                    _labelValue(
-                      'Discount',
-                      '£${(order?.approvedDiscounts ?? 0.0).toStringAsFixed(2)}',
-                      regularFont,
-                    ),
-                  if ((order?.salesDiscount ?? 0.0) > 0.0)
-                    _labelValue(
-                      'sale',
-                      '-£${order?.salesDiscount!.toStringAsFixed(2)}',
-                      regularFont,
-                    ),
-                  if ((order?.promoDiscount ?? 0.0) > 0.0)
-                    _labelValue(
-                      'Promo Discount',
-                      '-£${order?.promoDiscount!.toStringAsFixed(2)}',
-                      regularFont,
-                    ),
-                  if (orderResponse.type == 'Delivery')
-                    _labelValue(
-                      'Delivery Charges',
-                      '${order?.deliveryCharges?.toStringAsFixed(0)}%',
-                      regularFont,
-                    ),
-                  _labelValue(
-                    'Total Price',
-                    '£${order?.totalAmount?.toStringAsFixed(2)}',
-                    regularFont,
-                  ),
-                  dottedBorder(),
-                  pw.SizedBox(height: 5),
-                  _labelFooter(
-                    'Email: ${businessInfo?.user.email ?? ''}',
-                    regularFont,
-                  ),
-                  _labelFooter(
-                    'Location: ${businessInfo?.business.address ?? ''}',
-                    regularFont,
-                  ),
-                  pw.Center(
-                    child: pw.Text(
-                      'Thank you for your order!',
-                      style: pw.TextStyle(font: regularFont, fontSize: 8),
-                    ),
-                  ),
-                ],
-              ),
-            ],
-          );
-        },
-      ),
-    );
-
-    return pdf;
+  static Uint8List _encode(String text) {
+    return Uint8List.fromList(text.codeUnits);
   }
 
-  ///======================================================
-  /// UI Helpers
-  ///======================================================
-  static pw.Widget dottedBorder() {
-    return pw.Container(
-      margin: const pw.EdgeInsets.symmetric(vertical: 2),
-      height: 1.1,
-      decoration: pw.BoxDecoration(
-        border: pw.Border(
-          bottom: pw.BorderSide(
-            color: PdfColors.black,
-            width: 1,
-            style: pw.BorderStyle.dashed,
-          ),
-        ),
-      ),
-    );
+  static Uint8List _newLine() {
+    return Uint8List.fromList([0x0A]);
   }
 
-  static pw.Widget _itemRow(OrderItem item, pw.Font font) {
-    final name = item.title ?? '';
-    final qty = item.quantity ?? 0;
-    final price = item.price ?? 0;
-    final total = (qty * price).toStringAsFixed(2);
+  static Uint8List _newLine2() {
+    // 0x0A is the ASCII value for Line Feed (LF),
+    // which is the standard new line character on Unix-like systems (and the internet).
+    // 0x0D is the ASCII value for Carriage Return (CR).
+    // CR + LF (0x0D, 0x0A) is the standard new line for Windows/DOS.
 
-    return pw.Padding(
-      padding: pw.EdgeInsets.only(right: 4.0),
-      child: pw.Row(
-        children: [
-          pw.Expanded(
-            flex: 3,
-            child: pw.Text(name, style: pw.TextStyle(font: font, fontSize: 9)),
-          ),
-          pw.Expanded(
-            flex: 1,
-            child: pw.Text(
-              qty.toString(),
-              style: pw.TextStyle(font: font, fontSize: 9),
-              textAlign: pw.TextAlign.center,
-            ),
-          ),
-          pw.Expanded(
-            flex: 1,
-            child: pw.Text(
-              price.toStringAsFixed(2),
-              style: pw.TextStyle(font: font, fontSize: 9),
-              textAlign: pw.TextAlign.right,
-            ),
-          ),
-          pw.Expanded(
-            flex: 1,
-            child: pw.Text(
-              total,
-              style: pw.TextStyle(font: font, fontSize: 9),
-              textAlign: pw.TextAlign.right,
-            ),
-          ),
-        ],
-      ),
-    );
+    // If you need a more explicit/common sequence, use CR+LF:
+    return Uint8List.fromList([0x0D, 0x0A]);
+
+    // Alternatively, just a single Line Feed (LF) is often sufficient:
+    // return Uint8List.fromList([0x0A]);
   }
 
-  static pw.Widget _labelValue(String label, String value, pw.Font font) {
-    return pw.Padding(
-      padding: const pw.EdgeInsets.only(bottom: 2, right: 4.0),
-      child: pw.Row(
-        mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
-        children: [
-          pw.Text(label, style: pw.TextStyle(fontSize: 9, font: font)),
-          pw.Text(value, style: pw.TextStyle(fontSize: 9, font: font)),
-        ],
-      ),
-    );
+  static String _dashes(int count) => '-' * count;
+  static String _equals(int count) => '=' * count;
+  // static String _dots(int count) => '.' * count;
+  static void printLabelValueRightBold({
+    required BytesBuilder buffer,
+    required String label,
+    required String value,
+    required int totalWidth,
+    required List<int> escBoldOn,
+    required List<int> escBoldOff,
+    required List<int> Function(String) encode,
+  }) {
+    final spaceCount = totalWidth - label.length - value.length;
+
+    // Label (NORMAL)
+    buffer.add(encode(label + (' ' * (spaceCount > 0 ? spaceCount : 1))));
+
+    // Value (BOLD)
+    buffer.add(escBoldOn);
+    buffer.add(encode(value));
+    buffer.add(escBoldOff);
   }
 
-  static pw.Widget _labelFooter(String text, pw.Font font) {
-    return pw.Padding(
-      padding: const pw.EdgeInsets.only(bottom: 2),
-      child: pw.Center(
-        child: pw.Text(
-          text,
-          style: pw.TextStyle(fontSize: 8, font: font),
-          textAlign: pw.TextAlign.center,
-        ),
-      ),
-    );
+  /// Format label with right-aligned value (like in the receipt image)
+  static String _formatLabelValueRight(
+    String label,
+    String value,
+    int totalWidth,
+  ) {
+    final availableSpace = totalWidth - label.length - value.length;
+    if (availableSpace <= 0) {
+      // If no space, truncate value
+      final maxValueLen = totalWidth - label.length - 1;
+      return '$label ${maxValueLen > 0 ? _truncate(value, maxValueLen) : ''}';
+    }
+    return label + (' ' * availableSpace) + value;
+  }
+
+  static String _padRight(String text, int width) {
+    if (text.length >= width) return text.substring(0, width);
+    return text + ' ' * (width - text.length);
+  }
+
+  static String _padLeft(String text, int width) {
+    if (text.length >= width) return text.substring(0, width);
+    return ' ' * (width - text.length) + text;
+  }
+
+  static String _padCenter(String text, int width) {
+    if (text.length >= width) return text.substring(0, width);
+    final padding = width - text.length;
+    final leftPad = padding ~/ 2;
+    final rightPad = padding - leftPad;
+    return ' ' * leftPad + text + ' ' * rightPad;
+  }
+
+  static String _truncate(String text, int maxLength) {
+    if (text.length <= maxLength) return text;
+    return text.substring(0, maxLength - 3) + '...';
+  }
+
+  /// Word wrap text to fit within width
+  static List<String> _wrapText(String text, int maxWidth) {
+    if (text.length <= maxWidth) return [text];
+
+    final lines = <String>[];
+    final words = text.split(' ');
+    String currentLine = '';
+
+    for (var word in words) {
+      if ((currentLine + word).length <= maxWidth) {
+        currentLine += (currentLine.isEmpty ? '' : ' ') + word;
+      } else {
+        if (currentLine.isNotEmpty) {
+          lines.add(currentLine);
+        }
+        currentLine = word;
+      }
+    }
+
+    if (currentLine.isNotEmpty) {
+      lines.add(currentLine);
+    }
+
+    return lines;
   }
 
   static void _showMessage(BuildContext context, String msg, Color color) {
     if (context.mounted) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(msg), backgroundColor: color));
-    } else {
-      debugPrint('⚠️ Snackbar skipped: context not mounted. Message: $msg');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(msg),
+          backgroundColor: color,
+          duration: const Duration(seconds: 2),
+        ),
+      );
     }
   }
 }

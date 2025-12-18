@@ -779,10 +779,11 @@ void startLocalServer(BuildContext context) async {
                 await ReceiptPrinter.printKOT(
                   context: context,
                   orderResponse: res,
-                  // orderId: orderId,
-                  // orderType: orderType,
-                  // items: items,
+                  items: res.order?.items,
+                  orderId: res.order!.id.toString(),
+                  orderType: res.order?.orderType ?? 'Eat In',
                 );
+
                 successMessages.add('KOT printed successfully on');
                 anyPrintSuccess = true;
                 print("✅ KOT printed successfully");
